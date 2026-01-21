@@ -102,39 +102,70 @@ def geocode_with_cache(query: str, cache: Dict[str, Dict]) -> Optional[Tuple[flo
 
     cache[q] = {"ok": True, "lat": float(loc.latitude), "lon": float(loc.longitude)}
     return (float(loc.latitude), float(loc.longitude))
+from typing import List
+import requests
+from bs4 import BeautifulSoup
+import re
+import streamlit as st
 
 def scrape_d1_universities(url: str) -> List[str]:
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
+    headers = {
+        # User-Agent "type navigateur" (souvent indispensable sur Streamlit Cloud)
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        r.raise_for_status()
+    except Exception as e:
+        # On ne stoppe pas l'app ici; on renvoie une liste vide et on affichera un message plus haut.
+        st.warning(f"Impossible de récupérer la page universités: {url}\nDétail: {e}")
+        return []
+
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Sur ces pages, les écoles sont listées en texte (souvent sous forme de liste/paragraphes).
-    # On récupère tous les <li> et on filtre.
-    candidates = []
+    candidates: List[str] = []
+
+    # 1) Récupération depuis les <li>
     for li in soup.select("li"):
         t = clean_text(li.get_text(" ", strip=True))
-        if len(t) >= 4 and "NCAA" not in t and "Division" not in t:
+        if 4 <= len(t) <= 120 and "NCAA" not in t and "Division" not in t:
             candidates.append(t)
 
-    # fallback si la page change
+    # 2) Fallback: certains sites listent les écoles dans des liens <a>
+    if len(candidates) < 50:
+        for a in soup.select("a"):
+            t = clean_text(a.get_text(" ", strip=True))
+            if any(k in t for k in ["University", "College", "State", "Institute", "Academy"]):
+                if 4 <= len(t) <= 120 and "NCAA" not in t and "Division" not in t:
+                    candidates.append(t)
+
+    # 3) Fallback texte brut (dernier recours)
     if len(candidates) < 50:
         text = clean_text(soup.get_text(" ", strip=True))
-        # extraction naïve : lignes avec "University" / "College" / "State" etc.
         raw = re.split(r"\s{2,}|\n", text)
         for x in raw:
             t = clean_text(x)
             if any(k in t for k in ["University", "College", "State", "Institute", "Academy"]):
-                if 4 <= len(t) <= 80:
+                if 4 <= len(t) <= 120 and "NCAA" not in t and "Division" not in t:
                     candidates.append(t)
 
-    # dédoublonnage
+    # dédoublonnage + nettoyage final
     seen = set()
     out = []
     for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
+        c2 = clean_text(c)
+        if c2 and c2 not in seen:
+            seen.add(c2)
+            out.append(c2)
+
     return out
+
 
 @st.cache_data(ttl=24*3600)
 def load_university_list(include_men: bool, include_women: bool) -> List[str]:
@@ -225,12 +256,34 @@ if search.strip():
 else:
     schools_filtered = schools
 
-# Geocode universities (limité pour UX)
-limit = st.slider("Nombre d'universités à afficher sur la carte", 50, min(400, len(schools_filtered)), min(150, len(schools_filtered)), 25)
+# Geocode universities (limité pour UX) — version robuste
+n = len(schools_filtered)
+
+if n == 0:
+    st.error(
+        "Aucune université trouvée (liste vide). "
+        "La source web est peut-être bloquée/indisponible, ou tes filtres sont trop restrictifs."
+    )
+    st.stop()
+
+max_uni = min(400, n)
+min_uni = 1  # ne pas forcer 50 si la liste est petite
+default_uni = min(150, max_uni)
+step_uni = 25 if max_uni >= 25 else 1
+
+limit = st.slider(
+    "Nombre d'universités à afficher sur la carte",
+    min_value=min_uni,
+    max_value=max_uni,
+    value=default_uni,
+    step=step_uni,
+)
+
 schools_to_map = schools_filtered[:limit]
 
 uni_rows = []
 progress2 = st.progress(0)
+
 for i, name in enumerate(schools_to_map, start=1):
     q = f"{name}, USA"
     coord = geocode_with_cache(q, cache)
@@ -242,7 +295,9 @@ save_cache(CACHE_PATH, cache)
 
 uni_df = pd.DataFrame(uni_rows)
 if uni_df.empty:
-    st.error("Aucune université géocodée. (La source web a peut-être changé, ou le géocodage est bloqué.)")
+    st.error(
+        "Aucune université géocodée. (La source web a peut-être changé, ou le géocodage est bloqué.)"
+    )
     st.stop()
 
 # Map
